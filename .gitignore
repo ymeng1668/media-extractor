@@ -1,0 +1,17 @@
+build/
+cmake-build-*/
+bin/
+.idea/
+CMakeFiles/
+CMakeCache.txt
+Makefile
+cmake_install.cmake
+*.a
+*.o
+*.h264
+*.h265
+*.pcm
+*.adpcm
+*.json
+*.txt
+!CMakeLists.txt
