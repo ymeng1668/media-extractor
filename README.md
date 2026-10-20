@@ -10,13 +10,24 @@ This project is scoped to Streamax media-frame files and validated MP4 exports:
 - It treats `.mp4` inputs as existing containers and remuxes/copies them with `ffmpeg`.
 - When an MP4 has appended Streamax media-frame metadata after the normal MP4 boxes, it parses that tail for JSON/text sidecars without adding packet or network protocol support.
 
-The media-only implementation is synchronized from `n9m_engine` commit
-`febcca6` without a build/runtime dependency on that project. See
-[the sync record](doc/media_sync.md) for scope and intentional differences.
+The media-only implementation is maintained in the separate
+[`media-format-core`](https://github.com/ymeng1668/media-format-core) repository,
+pinned here as `deps/media-format-core`. Both this CLI and the camera-protocol
+consumer link that library independently. This project has no dependency on
+the camera-protocol consumer and is not its submodule. See
+[the integration record](doc/media_sync.md).
 
 ## Build
 
+Requires C++17, RapidJSON, and FFmpeg development libraries (`libavformat`,
+`libavcodec`, `libavutil`, `libswresample`; discovered through pkg-config on
+Unix/MinGW). External `ffmpeg`/`ffprobe` are still needed for privacy rendering
+and MP4 container processing, but raw-video/PCM muxing uses the shared library.
+For standalone MSVC builds, set `FFMPEG_DIR` and, for static FFmpeg, supply its
+transitive dependencies through `MEDIA_FORMAT_FFMPEG_EXTRA_LIBRARIES`.
+
 ```bash
+git submodule update --init --recursive
 cmake -S . -B build
 cmake --build build
 ctest --test-dir build --output-on-failure
@@ -27,6 +38,28 @@ The executable is written to:
 ```bash
 ./bin/media_extractor
 ```
+
+`bin/` also contains `libmedia-format-core.so` on Linux or
+`media-format-core.dll` on Windows. Deploy it beside the executable.
+
+To build only the shared dependency through this checkout:
+
+```bash
+cmake -S . -B build-lib -DMEDIA_EXTRACTOR_BUILD_APP=OFF -DBUILD_TESTING=OFF
+cmake --build build-lib
+```
+
+CMake links `media-format::core` (actual target `media-format-core`).
+Public headers are in `deps/media-format-core/include/media-format/`, with
+APIs in namespace `media_format`. Core tests have unique `media_format_` names
+and can be disabled with `MEDIA_FORMAT_BUILD_TESTS=OFF`.
+Set `MEDIA_EXTRACTOR_RUNTIME_DIR` for CLI output and `MEDIA_FORMAT_RUNTIME_DIR`
+for shared-library output. The default puts both in `bin/`.
+The core is position-independent and uses the shared MSVC CRT.
+For installed forward rendering on Linux, pass `--ai-sdk-dir` and include that
+SDK's `lib`/`opencv453/lib` directories in `LD_LIBRARY_PATH` before launch.
+For local core development, `MEDIA_FORMAT_SOURCE_DIR` may point to a sibling
+checkout; normal builds use the committed core submodule revision.
 
 ## Usage
 
@@ -115,7 +148,7 @@ For `.mp4`, `.mkv`, or `.mov` output specs, Streamax media-frame inputs are firs
 extracted to a temporary raw video payload, then muxed into the requested
 container with `ffmpeg` video stream copy. Existing MP4 inputs are remuxed/copied
 directly with `ffmpeg -c copy`. Streamax ADPCM is decoded with the supplied
-`third_party/AdpcmCodec`, skipping each frame's four-byte audio prefix and
+`deps/media-format-core/third_party/AdpcmCodec`, skipping each frame's four-byte audio prefix and
 preserving decoder state across frames. It is encoded to AAC for container
 output. Other audio codecs remain raw, with a warning when omitted from a
 container. `--no-decode-audio` retains raw audio without adding it to a container.

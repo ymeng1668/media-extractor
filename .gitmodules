@@ -1,0 +1,3 @@
+[submodule "deps/media-format-core"]
+	path = deps/media-format-core
+	url = https://github.com/ymeng1668/media-format-core.git

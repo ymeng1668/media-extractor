@@ -1,7 +1,8 @@
 #include "media_frame.h"
 #include "privacy_render.h"
 #include "mp4_metadata.h"
-#include "../third_party/AdpcmCodec.h"
+#include "url_writer.h"
+#include <media-format/adpcm.h>
 
 #include <algorithm>
 #include <cerrno>
@@ -22,7 +23,7 @@
 #include <rapidjson/stringbuffer.h>
 
 namespace fs = std::filesystem;
-using namespace media_extractor;
+using namespace media_format;
 
 namespace {
 
@@ -429,35 +430,13 @@ static std::string shell_quote(const std::string& s)
 #endif
 }
 
-static int mux_video_with_ffmpeg(const std::string& video_path,
-                                 bool h265,
-                                 uint32_t fps,
-                                 const Output& out,
-                                 const std::string& ffmpeg,
-                                 const std::string& output_path)
+static int mux_video(const std::string& video_path, uint32_t fps,
+                     const Output& out, const std::string& output_path)
 {
-    if (video_path.empty() || output_path.empty())
-        return 1;
-    std::string cmd = shell_quote(ffmpeg) + " -y -hide_banner -loglevel warning -fflags +genpts ";
-    cmd += h265 ? "-f hevc " : "-f h264 ";
-    if (fps > 0)
-        cmd += "-r " + std::to_string(fps) + " ";
-    cmd += "-i " + shell_quote(video_path) + " ";
-    if (!out.pcm_path.empty()) {
-        cmd += "-f s16le -ar " + std::to_string(out.sample_rate) + " -ac " + std::to_string(out.channels) +
-               " -i " + shell_quote(out.pcm_path) + " -map 0:v:0 -map 1:a:0 -c:a aac ";
-    } else {
-        cmd += "-an ";
-        if (!out.audio_path.empty())
-            std::fprintf(stderr, "Warning: audio was not decoded; raw audio retained separately.\n");
-    }
-    cmd += "-c:v copy -movflags +faststart ";
-    cmd += shell_quote(output_path);
-    std::fprintf(stderr, "Mux:     %s\n", output_path.c_str());
-    int rc = std::system(cmd.c_str());
-    if (rc != 0)
-        std::fprintf(stderr, "ffmpeg mux failed with code %d\n", rc);
-    return rc == 0 ? 0 : 1;
+    if (out.pcm_path.empty() && !out.audio_path.empty())
+        std::fprintf(stderr, "Warning: audio was not decoded; raw audio retained separately.\n");
+    return UrlWriter::mux(video_path, out.pcm_path, output_path, fps,
+                          out.sample_rate, out.channels, false);
 }
 
 static int remux_container_with_ffmpeg(const std::string& input_path,
@@ -945,8 +924,7 @@ static int process_one(const std::string& input_path,
         std::string mux_target = out.final_output_path;
         if (privacy)
             mux_target = out.final_output_path + ".privacy_src.mp4";
-        rc = mux_video_with_ffmpeg(out.video_path, stats.h265, stats.video_fps, out, opt.ffmpeg_path,
-                                   mux_target);
+        rc = mux_video(out.video_path, stats.video_fps, out, mux_target);
         if (rc == 0 && privacy) {
             rc = render_privacy(mux_target, out.final_output_path, out.events, out.video_times,
                     opt.face_privacy_mode, opt.face_blur_strength, opt.forward_privacy_mode,

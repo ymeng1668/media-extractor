@@ -1,10 +1,40 @@
-# Media Implementation Sync
+# Media Format Core
+
+## Shared Library Integration
+
+The independent `media-format-core` repository is now the authoritative
+media-only implementation (CMake alias `media-format::core`).
+Both this application and `n9m_engine` consume it as a pinned submodule at
+`deps/media-format-core`. Neither application includes the other as a submodule.
+The core has no dependency on either application.
+
+Public headers live in the core's `include/media-format/`, in namespace
+`media_format`. Both applications use the same
+frame parser, timestamp matcher, privacy renderer, indexed-MP4 validator,
+ADPCM decoder and libavformat/libavcodec video/PCM muxer. The muxer accepts
+generic timed-text cues; it has no protocol-event parsing or camera control.
+The applications retain their respective JSON/text and CLI contracts.
+
+`MEDIA_EXTRACTOR_BUILD_APP` controls this application's executable and
+`MEDIA_FORMAT_BUILD_TESTS` controls the shared core's tests.
+Core code uses PIC, Windows DLL exports, and the shared MSVC CRT.
+Tests have `media_format_` names to avoid parent collisions, and the
+`media_format_boundary` test guards against protocol source leaking into the
+media-only project. The previous target name is no longer provided.
+
+Normal raw-video/PCM muxing no longer launches ffmpeg. External ffmpeg/ffprobe
+remain required for privacy rendering and container operations.
+Deploy `libmedia-format-core.so` / `media-format-core.dll` with consumers.
+Changes to the shared implementation are committed in the core repository
+once, then both consumers' submodule pins are updated.
+
+## Historical Initial Port
 
 Source: `n9m_engine`, commit `febcca6b7de11d1ca9310c6fd20e8ce4b93763ec`.
 Sync date: 2026-10-20.
 
-Only this repository was changed. This is a standalone source port, not a
-submodule, symlink, or link to the other project's shared library.
+The initial port changed only this repository. The following describes that
+baseline before the shared-library integration above.
 
 ## Ported Components
 
@@ -32,8 +62,8 @@ The CLI remains local rather than importing camera/network command handling.
   rather than importing the other application's libavformat URL writer.
 - No generated or test media is included in the repository.
 
-The projects still have separate source copies. Future fixes must be ported
-and tested explicitly until a shared media library is adopted by both projects.
+These initial separate source copies have since been replaced by the shared
+library integration described above.
 
 ## SDK Archive
 
