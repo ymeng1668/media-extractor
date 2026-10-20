@@ -4,7 +4,7 @@
 
 This project is scoped to Streamax media-frame files and validated MP4 exports:
 
-- Its media decoder follows the documents in `doc/`, vendor reference code, and recorded-format validation. The MP4 footer layout is inferred from samples, not a formal vendor specification.
+- Its media decoder follows the documents in `deps/media-format-core/doc/`, vendor reference code, and recorded-format validation. The MP4 footer layout is inferred from samples, not a formal vendor specification.
 - It does not implement packet framing, device login, camera query/download, live view, server mode, encryption handling, or any network protocol.
 - It treats `.264` / `.265` inputs as Streamax media-frame files or raw Annex-B video payloads.
 - It treats `.mp4` inputs as existing containers and remuxes/copies them with `ffmpeg`.
@@ -15,7 +15,9 @@ The media-only implementation is maintained in the separate
 pinned here as `deps/media-format-core`. Both this CLI and the camera-protocol
 consumer link that library independently. This project has no dependency on
 the camera-protocol consumer and is not its submodule. See
-[the integration record](doc/media_sync.md).
+[the integration record](deps/media-format-core/doc/media_sync.md).
+Shared documentation lives in [`deps/media-format-core/doc/`](deps/media-format-core/doc/);
+the duplicate top-level `doc/` directory has been removed.
 
 ## Build
 
@@ -197,7 +199,7 @@ for privacy rendering but remain available for ordinary remux/JSON extraction.
 Raw Annex-B has no metadata timeline and cannot be privacy-rendered.
 
 The optional vendor SDK is loaded only for `--forward-*`. Its archive is under
-`doc/streamax_ainfo_parse_api/2026-09-22/`; CMake extracts it into the build
+`deps/media-format-core/doc/streamax_ainfo_parse_api/2026-09-22/`; CMake extracts it into the build
 directory. Override with `-DMEDIA_AI_SDK_DIR=/path/to/platform` at configure time
 or `--ai-sdk-dir /path/to/platform` at runtime. A relocated Linux SDK may need
 its `lib` and `opencv453/lib` directories in `LD_LIBRARY_PATH`. The supplied
