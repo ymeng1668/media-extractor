@@ -1,4 +1,7 @@
 #include "media_frame.h"
+#include "privacy_render.h"
+#include "mp4_metadata.h"
+#include "../third_party/AdpcmCodec.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -10,6 +13,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <string>
 #include <system_error>
 #include <vector>
@@ -29,25 +33,15 @@ struct Options {
     std::string batch_spec = ".raw";
     bool write_json = false;
     bool write_text = false;
-    enum class FacePrivacyMode {
-        None,
-        Mask,
-        Blur,
-        Frame,
-    } face_privacy_mode = FacePrivacyMode::None;
+    using FacePrivacyMode = PrivacyMode;
+    PrivacyMode face_privacy_mode = PrivacyMode::None;
+    PrivacyMode forward_privacy_mode = PrivacyMode::None;
+    int forward_blur_strength = 50;
+    std::string ai_sdk_dir;
+    bool decode_audio = true;
     int face_blur_strength = 25;
     std::string ffmpeg_path = "ffmpeg";
 };
-
-struct FaceRect {
-    int64_t frame = 0;
-    int x = 0;
-    int y = 0;
-    int w = 0;
-    int h = 0;
-};
-
-static constexpr int64_t kFacePrivacyHoldFrames = 30;
 
 struct Stats {
     uint64_t frames = 0;
@@ -73,6 +67,16 @@ struct Output {
     std::string audio_path;
     bool mux_mode = false;
     std::vector<MetadataEvent> events;
+    std::vector<VideoFrameTime> video_times;
+    std::unique_ptr<ForwardPrivacy> forward;
+    bool privacy = false;
+    int video_channel = -1;
+    bool decode_audio = true;
+    AudioCodec audio_codec = AudioCodec::ADPCM;
+    uint32_t sample_rate = 8000, channels = 1;
+    FILE* pcm = nullptr;
+    std::string pcm_path;
+    adpcm_state_t adpcm_state{};
 
     ~Output()
     {
@@ -81,6 +85,7 @@ struct Output {
 
     void close()
     {
+        if (pcm) { fclose(pcm); pcm = nullptr; }
         if (video) {
             fclose(video);
             video = nullptr;
@@ -145,6 +150,10 @@ static void print_help(const char* prog)
         "  --face-mask             Fill detected face_rect regions with black; outputs H.264 MP4\n"
         "  --face-blur[=0..100]    Blur detected face_rect regions; 0=off, 100=max (default: 25)\n"
         "  --face-frame            Draw boxes around detected face_rect regions; outputs H.264 MP4\n"
+        "  --forward-frame         Highlight ADAS vehicles (green) and pedestrians (yellow)\n"
+        "  --forward-blur[=0..100] Blur ADAS regions (default: 50); combine with one --face-* mode\n"
+        "  --ai-sdk-dir <dir>      Optional Streamax AI SDK platform directory\n"
+        "  --no-decode-audio       Keep raw audio; do not decode ADPCM or add it to containers\n"
         "  --ffmpeg <path>         ffmpeg executable for privacy modes (default: ffmpeg)\n"
         "\n"
         "Output spec:\n"
@@ -198,15 +207,28 @@ static bool parse_args(int argc, char** argv, Options& opt)
             opt.write_json = true;
         } else if (arg == "--text") {
             opt.write_text = true;
+        } else if (arg == "--no-decode-audio") {
+            opt.decode_audio = false;
+        } else if (arg == "--ai-sdk-dir" && i + 1 < argc) {
+            opt.ai_sdk_dir = argv[++i];
+        } else if (arg == "--forward-frame" || arg == "--forward-blur" ||
+                   arg.rfind("--forward-blur=", 0) == 0) {
+            if (opt.forward_privacy_mode != PrivacyMode::None) {
+                std::fprintf(stderr, "Error: select only one --forward-* rendering mode.\n");
+                return false;
+            }
+            if (arg.rfind("--forward-blur=", 0) == 0 &&
+                !parse_int("--forward-blur", arg.substr(15), 0, 100, opt.forward_blur_strength)) return false;
+            opt.forward_privacy_mode = arg == "--forward-frame" ? PrivacyMode::ForwardFrame : PrivacyMode::ForwardBlur;
         } else if (arg == "--face-mask") {
             if (opt.face_privacy_mode != Options::FacePrivacyMode::None) {
-                std::fprintf(stderr, "Error: use only one of --face-mask, --face-blur, or --face-frame.\n");
+                std::fprintf(stderr, "Error: select only one --face-* rendering mode.\n");
                 return false;
             }
             opt.face_privacy_mode = Options::FacePrivacyMode::Mask;
         } else if (arg == "--face-blur" || arg.rfind("--face-blur=", 0) == 0) {
             if (opt.face_privacy_mode != Options::FacePrivacyMode::None) {
-                std::fprintf(stderr, "Error: use only one of --face-mask, --face-blur, or --face-frame.\n");
+                std::fprintf(stderr, "Error: select only one --face-* rendering mode.\n");
                 return false;
             }
             opt.face_privacy_mode = Options::FacePrivacyMode::Blur;
@@ -221,7 +243,7 @@ static bool parse_args(int argc, char** argv, Options& opt)
             }
         } else if (arg == "--face-frame") {
             if (opt.face_privacy_mode != Options::FacePrivacyMode::None) {
-                std::fprintf(stderr, "Error: use only one of --face-mask, --face-blur, or --face-frame.\n");
+                std::fprintf(stderr, "Error: select only one --face-* rendering mode.\n");
                 return false;
             }
             opt.face_privacy_mode = Options::FacePrivacyMode::Frame;
@@ -390,6 +412,11 @@ static void ensure_parent_dir(const std::string& path)
 
 static std::string shell_quote(const std::string& s)
 {
+#ifdef _WIN32
+    std::string out = "\"";
+    for (char c : s) out += c == '"' ? "\\\"" : std::string(1, c);
+    return out + "\"";
+#else
     std::string out = "'";
     for (char c : s) {
         if (c == '\'')
@@ -399,440 +426,32 @@ static std::string shell_quote(const std::string& s)
     }
     out += "'";
     return out;
-}
-
-static std::string event_field_value(const MetadataEvent& ev,
-                                     const std::string& key)
-{
-    auto it = ev.fields.find(key);
-    return it == ev.fields.end() ? std::string{} : it->second;
-}
-
-static bool parse_slash_ints(const std::string& value,
-                             std::vector<int>& out,
-                             size_t max_items = 8)
-{
-    out.clear();
-    size_t pos = 0;
-    while (pos < value.size() && out.size() < max_items) {
-        while (pos < value.size() &&
-               !(std::isdigit((unsigned char)value[pos]) ||
-                 value[pos] == '-' || value[pos] == '+')) {
-            ++pos;
-        }
-        if (pos >= value.size())
-            break;
-        char* endp = nullptr;
-        long v = std::strtol(value.c_str() + pos, &endp, 10);
-        if (endp == value.c_str() + pos)
-            return false;
-        out.push_back((int)v);
-        pos = (size_t)(endp - value.c_str());
-    }
-    return !out.empty();
-}
-
-static bool parse_rect_value(const std::string& value,
-                             int& x, int& y, int& w, int& h)
-{
-    std::vector<int> nums;
-    if (!parse_slash_ints(value, nums, 8) || nums.size() < 4)
-        return false;
-    x = nums[0];
-    y = nums[1];
-    w = nums[2];
-    h = nums[3];
-    return w > 8 && h > 8;
-}
-
-static bool parse_frame_size_from_events(const std::vector<MetadataEvent>& events,
-                                         int& width,
-                                         int& height)
-{
-    for (const auto& ev : events) {
-        std::vector<int> nums;
-        std::string spf = event_field_value(ev, "spf");
-        if (!spf.empty() && parse_slash_ints(spf, nums, 8)) {
-            if (nums.size() >= 4 && nums[2] > 0 && nums[3] > 0) {
-                width = nums[2];
-                height = nums[3];
-                return true;
-            }
-            if (nums.size() >= 5 && nums[3] > 0 && nums[4] > 0) {
-                width = nums[3];
-                height = nums[4];
-                return true;
-            }
-        }
-        std::string rx = event_field_value(ev, "rx");
-        if (!rx.empty() && parse_slash_ints(rx, nums, 8) &&
-            nums.size() >= 4 && nums[2] > 0 && nums[3] > 0) {
-            width = nums[2];
-            height = nums[3];
-            return true;
-        }
-    }
-    return false;
-}
-
-static std::vector<FaceRect> extract_face_rects_from_events(
-    const std::vector<MetadataEvent>& events)
-{
-    std::map<int64_t, FaceRect> by_frame;
-    int frame_w = 1920;
-    int frame_h = 1080;
-    parse_frame_size_from_events(events, frame_w, frame_h);
-
-    for (const auto& ev : events) {
-        if (ev.kind != "T13_DATA")
-            continue;
-        std::string rect_value = event_field_value(ev, "face_rect");
-        if (rect_value.empty())
-            continue;
-
-        int x = 0, y = 0, w = 0, h = 0;
-        if (!parse_rect_value(rect_value, x, y, w, h))
-            continue;
-
-        // Expand the detected face/head box slightly for privacy coverage.
-        int mx = std::max(8, w / 8);
-        int my = std::max(8, h / 8);
-        x -= mx;
-        y -= my;
-        w += mx * 2;
-        h += my * 2;
-
-        x = std::max(0, x);
-        y = std::max(0, y);
-        if (frame_w > 0 && x + w > frame_w)
-            w = frame_w - x;
-        if (frame_h > 0 && y + h > frame_h)
-            h = frame_h - y;
-        if (w <= 8 || h <= 8)
-            continue;
-
-        FaceRect r;
-        r.frame = std::max<int64_t>(0, (int64_t)ev.frame_index);
-        r.x = x;
-        r.y = y;
-        r.w = w;
-        r.h = h;
-        by_frame.emplace(r.frame, r);
-    }
-
-    std::vector<FaceRect> out;
-    out.reserve(by_frame.size());
-    for (const auto& kv : by_frame)
-        out.push_back(kv.second);
-    return out;
-}
-
-static std::vector<FaceRect> coalesce_face_rects(std::vector<FaceRect> rects,
-                                                 bool merge_nearby = false)
-{
-    if (rects.empty())
-        return rects;
-
-    std::sort(rects.begin(), rects.end(),
-              [](const FaceRect& a, const FaceRect& b) {
-                  return a.frame < b.frame;
-              });
-
-    std::vector<FaceRect> ranges;
-    ranges.reserve(rects.size());
-    for (size_t i = 0; i < rects.size(); ++i) {
-        if (i > 0 && rects[i].frame <= rects[i - 1].frame)
-            continue;
-        int64_t start = rects[i].frame;
-        int64_t end = start + kFacePrivacyHoldFrames;
-        if (i + 1 < rects.size()) {
-            int64_t next = rects[i + 1].frame;
-            if (next > start && next <= end + 1)
-                end = next - 1;
-        }
-        FaceRect r = rects[i];
-        r.frame = (start << 32) | (end & 0xffffffffLL);
-        ranges.push_back(r);
-    }
-
-    if (ranges.empty())
-        return ranges;
-
-    auto close_rect = [](const FaceRect& a, const FaceRect& b) {
-        return std::abs(a.x - b.x) <= 3 && std::abs(a.y - b.y) <= 3 &&
-               std::abs(a.w - b.w) <= 3 && std::abs(a.h - b.h) <= 3;
-    };
-    auto nearby_rect = [](const FaceRect& a, const FaceRect& b) {
-        static constexpr int kFacePrivacyMergePad = 64;
-        return a.x <= b.x + b.w + kFacePrivacyMergePad &&
-               b.x <= a.x + a.w + kFacePrivacyMergePad &&
-               a.y <= b.y + b.h + kFacePrivacyMergePad &&
-               b.y <= a.y + a.h + kFacePrivacyMergePad;
-    };
-    auto union_rect = [](FaceRect& a, const FaceRect& b) {
-        int x1 = std::min(a.x, b.x);
-        int y1 = std::min(a.y, b.y);
-        int x2 = std::max(a.x + a.w, b.x + b.w);
-        int y2 = std::max(a.y + a.h, b.y + b.h);
-        a.x = x1;
-        a.y = y1;
-        a.w = x2 - x1;
-        a.h = y2 - y1;
-    };
-
-    std::vector<FaceRect> out;
-    FaceRect cur = ranges[0];
-    int64_t cur_start = cur.frame >> 32;
-    int64_t cur_end = cur.frame & 0xffffffffLL;
-    for (size_t i = 1; i < ranges.size(); ++i) {
-        int64_t start = ranges[i].frame >> 32;
-        int64_t end = ranges[i].frame & 0xffffffffLL;
-        bool same_region = merge_nearby ? nearby_rect(cur, ranges[i])
-                                        : close_rect(cur, ranges[i]);
-        if (start <= cur_end + 1 && same_region) {
-            cur_end = std::max(cur_end, end);
-            if (merge_nearby)
-                union_rect(cur, ranges[i]);
-            continue;
-        }
-        cur.frame = (cur_start << 32) | (cur_end & 0xffffffffLL);
-        out.push_back(cur);
-        cur = ranges[i];
-        cur_start = start;
-        cur_end = end;
-    }
-    cur.frame = (cur_start << 32) | (cur_end & 0xffffffffLL);
-    out.push_back(cur);
-    return out;
-}
-
-static bool probe_video_size_ffprobe(const std::string& input_path,
-                                     int& width,
-                                     int& height)
-{
-    std::string cmd =
-        "ffprobe -v error -select_streams v:0 "
-        "-show_entries stream=width,height -of csv=p=0:s=x " +
-        shell_quote(input_path);
-    FILE* pipe = popen(cmd.c_str(), "r");
-    if (!pipe)
-        return false;
-    char buf[128] = {};
-    std::string out;
-    while (fgets(buf, sizeof(buf), pipe))
-        out += buf;
-    pclose(pipe);
-    size_t x = out.find('x');
-    if (x == std::string::npos)
-        return false;
-    try {
-        int w = std::stoi(out.substr(0, x));
-        int h = std::stoi(out.substr(x + 1));
-        if (w <= 0 || h <= 0)
-            return false;
-        width = w;
-        height = h;
-        return true;
-    } catch (...) {
-        return false;
-    }
-}
-
-static void scale_face_rects_to_video(std::vector<FaceRect>& rects,
-                                      int metadata_w,
-                                      int metadata_h,
-                                      int video_w,
-                                      int video_h)
-{
-    if (rects.empty() || metadata_w <= 0 || metadata_h <= 0 ||
-        video_w <= 0 || video_h <= 0)
-        return;
-    const double sx = (double)video_w / (double)metadata_w;
-    const double sy = (double)video_h / (double)metadata_h;
-    for (auto& r : rects) {
-        r.x = (int)std::llround((double)r.x * sx);
-        r.y = (int)std::llround((double)r.y * sy);
-        r.w = std::max(2, (int)std::llround((double)r.w * sx));
-        r.h = std::max(2, (int)std::llround((double)r.h * sy));
-        r.x = std::max(0, std::min(r.x, video_w - 2));
-        r.y = std::max(0, std::min(r.y, video_h - 2));
-        r.w = std::max(2, std::min(r.w, video_w - r.x));
-        r.h = std::max(2, std::min(r.h, video_h - r.y));
-    }
-}
-
-static bool write_face_draw_filter_script(const fs::path& path,
-                                          const std::vector<FaceRect>& rects,
-                                          Options::FacePrivacyMode mode)
-{
-    FILE* fp = fopen(path.string().c_str(), "wb");
-    if (!fp) {
-        std::fprintf(stderr, "Cannot write face filter script: %s\n",
-                     path.string().c_str());
-        return false;
-    }
-    if (rects.empty()) {
-        fputs("null\n", fp);
-        fclose(fp);
-        return true;
-    }
-
-    auto ranges = coalesce_face_rects(rects);
-    for (size_t i = 0; i < ranges.size(); ++i) {
-        FaceRect r = ranges[i];
-        int64_t start = r.frame >> 32;
-        int64_t end = r.frame & 0xffffffffLL;
-        if (i)
-            fputs(",\n", fp);
-        const char* color = mode == Options::FacePrivacyMode::Frame
-                          ? "lime@0.95" : "black@1.0";
-        const char* thick = mode == Options::FacePrivacyMode::Frame ? "4" : "fill";
-        std::fprintf(fp,
-                     "drawbox=x=%d:y=%d:w=%d:h=%d:color=%s:t=%s:enable='between(n,%lld,%lld)'",
-                     r.x, r.y, r.w, r.h, color, thick,
-                     (long long)start, (long long)end);
-    }
-    fputc('\n', fp);
-    fclose(fp);
-    return true;
-}
-
-static bool write_face_blur_filter_script(const fs::path& path,
-                                          const std::vector<FaceRect>& rects,
-                                          int blur_strength)
-{
-    FILE* fp = fopen(path.string().c_str(), "wb");
-    if (!fp) {
-        std::fprintf(stderr, "Cannot write face blur filter script: %s\n",
-                     path.string().c_str());
-        return false;
-    }
-
-    blur_strength = std::max(0, std::min(100, blur_strength));
-    auto ranges = coalesce_face_rects(rects, true);
-    if (ranges.empty() || blur_strength == 0) {
-        fputs("[0:v]null[vout]\n", fp);
-        fclose(fp);
-        return true;
-    }
-
-    const int luma_radius = std::max(1, 1 + (blur_strength * 9 + 50) / 100);
-    const int chroma_radius = std::max(1, luma_radius / 2);
-    const int blur_power = std::max(1, 1 + (blur_strength * 2 + 50) / 100);
-    for (size_t i = 0; i < ranges.size(); ++i) {
-        FaceRect r = ranges[i];
-        int64_t start = r.frame >> 32;
-        int64_t end = r.frame & 0xffffffffLL;
-        if (i == 0) {
-            std::fprintf(fp, "[0:v]split=2[base%zu][crop%zu];\n", i, i);
-        } else {
-            std::fprintf(fp, "[v%zu]split=2[base%zu][crop%zu];\n",
-                         i - 1, i, i);
-        }
-        std::fprintf(fp,
-                     "[crop%zu]crop=w=%d:h=%d:x=%d:y=%d,"
-                     "boxblur=luma_radius=%d:luma_power=%d:chroma_radius=%d:chroma_power=%d"
-                     "[blur%zu];\n",
-                     i, r.w, r.h, r.x, r.y,
-                     luma_radius, blur_power, chroma_radius, blur_power, i);
-        if (i + 1 == ranges.size()) {
-            std::fprintf(fp,
-                         "[base%zu][blur%zu]overlay=x=%d:y=%d:enable='between(n,%lld,%lld)'[vout]\n",
-                         i, i, r.x, r.y,
-                         (long long)start, (long long)end);
-        } else {
-            std::fprintf(fp,
-                         "[base%zu][blur%zu]overlay=x=%d:y=%d:enable='between(n,%lld,%lld)'[v%zu];\n",
-                         i, i, r.x, r.y,
-                         (long long)start, (long long)end, i);
-        }
-    }
-
-    fclose(fp);
-    return true;
-}
-
-static int transcode_face_privacy_mp4(const std::string& input_path,
-                                      const std::string& output_path,
-                                      const std::vector<MetadataEvent>& events,
-                                      Options::FacePrivacyMode mode,
-                                      int blur_strength,
-                                      const std::string& ffmpeg_path)
-{
-    if (mode == Options::FacePrivacyMode::None)
-        return 0;
-
-    ensure_parent_dir(output_path);
-    std::vector<FaceRect> rects = extract_face_rects_from_events(events);
-    int metadata_w = 1920;
-    int metadata_h = 1080;
-    parse_frame_size_from_events(events, metadata_w, metadata_h);
-    int video_w = 0;
-    int video_h = 0;
-    if (probe_video_size_ffprobe(input_path, video_w, video_h)) {
-        scale_face_rects_to_video(rects, metadata_w, metadata_h,
-                                  video_w, video_h);
-    }
-
-    if (rects.empty()) {
-        std::fprintf(stderr,
-                     "Warning: --face-* requested but no face_rect metadata was found; "
-                     "transcoding without face overlay.\n");
-    } else {
-        std::fprintf(stderr,
-                     "Face privacy: %zu face metadata frame(s); holding last region up to %lld frame(s)\n",
-                     rects.size(), (long long)kFacePrivacyHoldFrames);
-        if (mode == Options::FacePrivacyMode::Blur) {
-            std::fprintf(stderr, "Face blur strength: %d/100\n",
-                         std::max(0, std::min(100, blur_strength)));
-        }
-    }
-
-    fs::path filter_path = output_path;
-    filter_path += ".face_filter.txt";
-    std::string cmd = shell_quote(ffmpeg_path) +
-        " -y -hide_banner -loglevel warning -i " + shell_quote(input_path);
-    if (mode == Options::FacePrivacyMode::Blur) {
-        if (!write_face_blur_filter_script(filter_path, rects, blur_strength))
-            return 1;
-        cmd += " -filter_complex_script " + shell_quote(filter_path.string()) +
-               " -map " + shell_quote("[vout]") +
-               " -map " + shell_quote("0:a?") +
-               " -map " + shell_quote("0:s?");
-    } else {
-        if (!write_face_draw_filter_script(filter_path, rects, mode))
-            return 1;
-        cmd += " -filter_script:v " + shell_quote(filter_path.string()) +
-               " -map 0";
-    }
-    cmd += " -c:v libx264 -preset veryfast -crf 27 -pix_fmt yuv420p"
-           " -c:a copy -c:s copy -movflags +faststart " +
-           shell_quote(output_path);
-
-    std::fprintf(stderr, "Face privacy transcode: %s\n", output_path.c_str());
-    int rc = std::system(cmd.c_str());
-    std::error_code ec;
-    fs::remove(filter_path, ec);
-    if (rc != 0) {
-        std::fprintf(stderr, "ffmpeg face privacy transcode failed with code %d\n", rc);
-        return 1;
-    }
-    return 0;
+#endif
 }
 
 static int mux_video_with_ffmpeg(const std::string& video_path,
                                  bool h265,
                                  uint32_t fps,
+                                 const Output& out,
+                                 const std::string& ffmpeg,
                                  const std::string& output_path)
 {
     if (video_path.empty() || output_path.empty())
         return 1;
-    std::string cmd = "ffmpeg -y -hide_banner -loglevel warning -fflags +genpts ";
+    std::string cmd = shell_quote(ffmpeg) + " -y -hide_banner -loglevel warning -fflags +genpts ";
     cmd += h265 ? "-f hevc " : "-f h264 ";
     if (fps > 0)
         cmd += "-r " + std::to_string(fps) + " ";
     cmd += "-i " + shell_quote(video_path) + " ";
-    cmd += "-an -c:v copy -movflags +faststart ";
+    if (!out.pcm_path.empty()) {
+        cmd += "-f s16le -ar " + std::to_string(out.sample_rate) + " -ac " + std::to_string(out.channels) +
+               " -i " + shell_quote(out.pcm_path) + " -map 0:v:0 -map 1:a:0 -c:a aac ";
+    } else {
+        cmd += "-an ";
+        if (!out.audio_path.empty())
+            std::fprintf(stderr, "Warning: audio was not decoded; raw audio retained separately.\n");
+    }
+    cmd += "-c:v copy -movflags +faststart ";
     cmd += shell_quote(output_path);
     std::fprintf(stderr, "Mux:     %s\n", output_path.c_str());
     int rc = std::system(cmd.c_str());
@@ -1068,20 +687,52 @@ static int process_streamax_media(const std::string& input_path,
                 stats.video_fps = hdr.video_info.fps;
             append_frame_events(out, hdr, stats);
         }
+        if (out.forward && !out.forward->read_frame(hdr, ext, hdr.extend_length, stats.video_frames)) {
+            std::fprintf(stderr, "Forward metadata failed: %s\n", out.forward->error().c_str());
+            return 1;
+        }
+        if (out.privacy && is_video_frame(hdr.frame_type)) {
+            if (out.video_channel >= 0 && out.video_channel != hdr.channel) {
+                std::fprintf(stderr, "Privacy rendering requires a single video channel per input.\n");
+                return 1;
+            }
+            out.video_channel = hdr.channel;
+        }
+        if (is_video_frame(hdr.frame_type) && hdr.frame_length > 0 && hdr.has_virtual_time)
+            out.video_times.push_back({hdr.virtual_pts, static_cast<int64_t>(stats.video_frames)});
+        if (hdr.has_audio_info && hdr.frame_type == FrameType::Audio) {
+            if (!out.pcm_path.empty() && (out.audio_codec != hdr.audio_info.codec ||
+                out.sample_rate != hdr.audio_info.sample_rate || out.channels != hdr.audio_info.channels)) {
+                std::fprintf(stderr, "Audio format changed during recording; refusing mixed PCM output.\n");
+                return 1;
+            }
+            out.audio_codec = hdr.audio_info.codec;
+            if (hdr.audio_info.sample_rate) out.sample_rate = hdr.audio_info.sample_rate;
+            out.channels = hdr.audio_info.channels;
+        }
 
         if (is_video_frame(hdr.frame_type) && hdr.frame_length > 0) {
             bool h265 = frame_payload_is_h265(hdr);
             FILE* f = out.get_video(h265);
-            if (f)
-                fwrite(payload, 1, hdr.frame_length, f);
+            if (!f || fwrite(payload, 1, hdr.frame_length, f) != hdr.frame_length) return 1;
             stats.video_frames++;
             stats.video_bytes += hdr.frame_length;
             stats.h265 = h265;
             stats.saw_video = true;
         } else if (hdr.frame_type == FrameType::Audio && hdr.frame_length > 0) {
             FILE* f = out.get_audio();
-            if (f)
-                fwrite(payload, 1, hdr.frame_length, f);
+            if (!f || fwrite(payload, 1, hdr.frame_length, f) != hdr.frame_length) return 1;
+            if (out.decode_audio && out.audio_codec == AudioCodec::ADPCM && hdr.frame_length > 4) {
+                if (!out.pcm) {
+                    out.pcm_path = out.base + ".pcm";
+                    out.pcm = fopen(out.pcm_path.c_str(), "wb");
+                    if (!out.pcm) return 1;
+                }
+                std::vector<short> decoded((hdr.frame_length - 4) * 4);
+                int bytes = adpcm_decoder(reinterpret_cast<char*>(const_cast<uint8_t*>(payload + 4)),
+                    decoded.data(), static_cast<int>(hdr.frame_length - 4), &out.adpcm_state);
+                if (bytes <= 0 || fwrite(decoded.data(), 1, bytes, out.pcm) != static_cast<size_t>(bytes)) return 1;
+            }
             stats.audio_frames++;
             stats.audio_bytes += hdr.frame_length;
         }
@@ -1206,7 +857,12 @@ static int process_one(const std::string& input_path,
     }
 
     std::string effective_spec = spec;
-    if (opt.face_privacy_mode != Options::FacePrivacyMode::None) {
+    const bool privacy = opt.face_privacy_mode != PrivacyMode::None || opt.forward_privacy_mode != PrivacyMode::None;
+    if (privacy && fmt == InputFormat::RawAnnexB) {
+        std::fprintf(stderr, "Privacy rendering requires Type 13 metadata and video PTS; raw Annex-B has neither.\n");
+        return 1;
+    }
+    if (privacy) {
         fs::path spec_path(effective_spec);
         if (effective_spec.empty() ||
             lower_ascii(spec_path.extension().string()) == ".raw") {
@@ -1218,9 +874,24 @@ static int process_one(const std::string& input_path,
     }
 
     Output out;
+    out.privacy = privacy;
+    out.decode_audio = opt.decode_audio;
+    if (opt.forward_privacy_mode != PrivacyMode::None)
+        out.forward = std::make_unique<ForwardPrivacy>(opt.ai_sdk_dir);
     out.mux_mode = is_container_spec(effective_spec);
     if (out.mux_mode) {
         out.final_output_path = container_output_for(input_path, effective_spec, batch_mode);
+        if (privacy) {
+            fs::path mp4(out.final_output_path);
+            mp4.replace_extension(".mp4");
+            out.final_output_path = mp4.string();
+            std::error_code ec;
+            if (fs::equivalent(input_path, out.final_output_path, ec) ||
+                fs::absolute(input_path).lexically_normal() == fs::absolute(out.final_output_path).lexically_normal()) {
+                std::fprintf(stderr, "Privacy rendering requires an output different from the input.\n");
+                return 1;
+            }
+        }
         fs::path final_path(out.final_output_path);
         fs::path dir = final_path.parent_path();
         if (dir.empty())
@@ -1243,18 +914,25 @@ static int process_one(const std::string& input_path,
     } else if (fmt == InputFormat::RawAnnexB) {
         rc = process_raw_annexb(data, out, stats);
     } else if (fmt == InputFormat::Mp4Container) {
-        if (opt.write_json || opt.write_text ||
-            opt.face_privacy_mode != Options::FacePrivacyMode::None) {
+        if (privacy) {
+            rc = read_indexed_mp4_metadata(input_path, data,
+                    find_mp4_appended_media_offset(data.data(), data.size()), out.events,
+                    out.video_times, out.forward.get()) ? 0 : 1;
+            stats.video_frames = out.video_times.size();
+            for (const auto& event : out.events) {
+                if (event.kind == "T13_DATA") ++stats.type13_events;
+                else if (event.kind == "T15_DATA") ++stats.type15_events;
+                else if (event.kind == "GPS") ++stats.gps_events;
+            }
+        } else if (opt.write_json || opt.write_text) {
             rc = process_mp4_appended_metadata(input_path, data, out, stats);
         }
         if (rc != 0)
             return rc;
-        if (opt.face_privacy_mode != Options::FacePrivacyMode::None) {
-            rc = transcode_face_privacy_mp4(input_path, out.final_output_path,
-                                            out.events,
-                                            opt.face_privacy_mode,
-                                            opt.face_blur_strength,
-                                            opt.ffmpeg_path);
+        if (privacy) {
+            rc = render_privacy(input_path, out.final_output_path, out.events, out.video_times,
+                    opt.face_privacy_mode, opt.face_blur_strength, opt.forward_privacy_mode,
+                    opt.forward_blur_strength, out.forward.get(), opt.ffmpeg_path);
         } else {
             rc = out.mux_mode
                 ? remux_container_with_ffmpeg(input_path, out.final_output_path)
@@ -1265,23 +943,24 @@ static int process_one(const std::string& input_path,
 
     if (rc == 0 && out.mux_mode && fmt != InputFormat::Mp4Container) {
         std::string mux_target = out.final_output_path;
-        if (opt.face_privacy_mode != Options::FacePrivacyMode::None)
+        if (privacy)
             mux_target = out.final_output_path + ".privacy_src.mp4";
-        rc = mux_video_with_ffmpeg(out.video_path, stats.h265, stats.video_fps,
+        rc = mux_video_with_ffmpeg(out.video_path, stats.h265, stats.video_fps, out, opt.ffmpeg_path,
                                    mux_target);
-        if (rc == 0 && opt.face_privacy_mode != Options::FacePrivacyMode::None) {
-            rc = transcode_face_privacy_mp4(mux_target, out.final_output_path,
-                                            out.events,
-                                            opt.face_privacy_mode,
-                                            opt.face_blur_strength,
-                                            opt.ffmpeg_path);
+        if (rc == 0 && privacy) {
+            rc = render_privacy(mux_target, out.final_output_path, out.events, out.video_times,
+                    opt.face_privacy_mode, opt.face_blur_strength, opt.forward_privacy_mode,
+                    opt.forward_blur_strength, out.forward.get(), opt.ffmpeg_path);
             std::error_code ec;
             fs::remove(mux_target, ec);
         }
         if (rc == 0) {
             std::error_code ec;
             fs::remove(out.video_path, ec);
-            fs::remove(out.audio_path, ec);
+            if (!out.pcm_path.empty()) {
+                fs::remove(out.pcm_path, ec);
+                fs::remove(out.audio_path, ec);
+            }
         }
     }
 
