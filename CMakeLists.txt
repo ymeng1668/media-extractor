@@ -15,6 +15,17 @@ add_subdirectory("${MEDIA_FORMAT_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/media
 if(MEDIA_EXTRACTOR_BUILD_APP)
     add_executable(media_extractor app/main.cpp)
     target_link_libraries(media_extractor PRIVATE media-format::core)
+    set(MEDIA_EXTRACTOR_PRIVACY_PLUGIN_DIR "${MEDIA_FORMAT_SOURCE_DIR}/plugin/python/ai/privacy-redaction"
+        CACHE PATH "Privacy redaction Python plugin directory")
+    set(_privacy_python "")
+    if(MEDIA_FORMAT_ENABLE_PYTHON_BRIDGE)
+        find_package(Python3 3.11 REQUIRED COMPONENTS Interpreter)
+        set(_privacy_python "${Python3_EXECUTABLE}")
+    endif()
+    target_compile_definitions(media_extractor PRIVATE
+        MEDIA_EXTRACTOR_PRIVACY_PLUGIN_DIR="${MEDIA_EXTRACTOR_PRIVACY_PLUGIN_DIR}"
+        MEDIA_EXTRACTOR_PYTHON_RUNTIME_DIR="${MEDIA_FORMAT_SOURCE_DIR}/plugin/python"
+        MEDIA_EXTRACTOR_PRIVACY_PYTHON="${_privacy_python}")
     find_path(RAPIDJSON_INCLUDE_DIR rapidjson/document.h REQUIRED)
     target_include_directories(media_extractor PRIVATE "${RAPIDJSON_INCLUDE_DIR}")
     set_target_properties(media_extractor PROPERTIES
@@ -35,7 +46,16 @@ endif()
 if(BUILD_TESTING AND MEDIA_EXTRACTOR_BUILD_APP)
     find_package(Python3 COMPONENTS Interpreter QUIET)
     find_program(MEDIA_EXTRACTOR_TEST_FFMPEG ffmpeg)
+    find_program(MEDIA_EXTRACTOR_TEST_FFPROBE ffprobe)
     if(Python3_Interpreter_FOUND AND MEDIA_EXTRACTOR_TEST_FFMPEG)
+        if(MEDIA_FORMAT_ENABLE_PYTHON_BRIDGE AND MEDIA_EXTRACTOR_TEST_FFPROBE)
+            add_test(NAME media_extractor_python_privacy_cli COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/python_privacy_cli_test.py"
+                "$<TARGET_FILE:media_extractor>" "${MEDIA_EXTRACTOR_TEST_FFMPEG}"
+                "${MEDIA_EXTRACTOR_TEST_FFPROBE}" "${MEDIA_EXTRACTOR_PRIVACY_PLUGIN_DIR}")
+            set_tests_properties(media_extractor_python_privacy_cli PROPERTIES
+                SKIP_RETURN_CODE 77 TIMEOUT 120 ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+        endif()
         foreach(_test media_cli privacy_timing_cli)
             add_test(NAME media_extractor_${_test} COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/${_test}_test.py"

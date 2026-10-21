@@ -49,6 +49,7 @@ with tempfile.TemporaryDirectory(prefix="media-extraction-") as folder:
         # Deliberately put video PTS after AI metadata to exercise entry-order independence.
         entries = [ext(1, struct.pack("<I", 64 | (64 << 12) | (25 << 24))),
                    ext(13, struct.pack("<IQI", 0, 1000 + i * 40, len(text)) + text),
+                   ext(15, bytes(12)),
                    ext(3, struct.pack("<Q", 1000 + i * 40))]
         data += frame(b"2dc" if i == 0 else b"3dc", encoded[a:b], entries)
         data += frame(b"4dc", audio_payload, [])
@@ -70,6 +71,7 @@ with tempfile.TemporaryDirectory(prefix="media-extraction-") as folder:
     check(len(ai) == 8 and ai[0]["fields"]["video_pts"] == "1000", "AI/video PTS fields lost")
     check(any(e["kind"] == "GPS" and e["fields"]["lat"] == "37.392626" for e in events),
           "Embedded GPS extraction missing")
+    check(not any(e["kind"].endswith("_HEX") for e in events), "Hex exported without --hex")
     output = root / "audio.mp4"
     proc = run([APP, str(source), "--o", str(output)])
     check(proc.returncode == 0, proc.stderr.decode(errors="replace"))
@@ -78,11 +80,41 @@ with tempfile.TemporaryDirectory(prefix="media-extraction-") as folder:
     streams = json.loads(probe.stdout)["streams"]
     check(any(s["codec_name"] == "aac" for s in streams), "Container audio missing")
     check(any(s["codec_name"] == "h264" for s in streams), "Container video missing")
+    check(any(s["codec_name"] == "mov_text" for s in streams), "Default telemetry subtitles missing")
+    subtitles = run([FFMPEG, "-v", "error", "-i", str(output), "-map", "0:s:0", "-f", "srt", "pipe:1"])
+    check(subtitles.returncode == 0 and b"GPS" in subtitles.stdout and b"T13_DATA" in subtitles.stdout,
+          "Readable telemetry cues missing")
     decoded = run([FFMPEG, "-v", "error", "-i", str(output), "-f", "null", "-"])
     check(decoded.returncode == 0 and not decoded.stderr, "Mux output does not decode cleanly")
     rawonly = root / "rawonly"
     proc = run([APP, str(source), "--o", str(rawonly / ".raw"), "--no-decode-audio"])
     check(proc.returncode == 0 and not list(rawonly.glob("*.pcm")), "Raw-audio option ignored")
-    for option in ["--server", "--download", "--raw-stream", "--host", "--aes-key"]:
+    no_subtitles = root / "no-subtitles.mp4"
+    proc = run([APP, str(source), "--o", str(no_subtitles), "--sub-track", "off", "--json", "--hex"])
+    check(proc.returncode == 0, proc.stderr.decode(errors="replace"))
+    streams = json.loads(run(["ffprobe", "-v", "error", "-show_streams", "-of", "json", str(no_subtitles)]).stdout)["streams"]
+    check(not any(s["codec_type"] == "subtitle" for s in streams), "--sub-track off ignored")
+    hex_events = json.loads(no_subtitles.with_suffix(".json").read_text())
+    check(len([e for e in hex_events if e["kind"] == "T13_HEX"]) == 8, "Raw Type 13 data missing")
+    check(len([e for e in hex_events if e["kind"] == "T15_HEX" and e["fields"]["hex"] == "00" * 12]) == 8,
+          "Raw Type 15 bytes changed or missing")
+    check(next(e["fields"]["hex"] for e in hex_events if e["kind"] == "T13_HEX").endswith(text.hex()),
+          "Raw Type 13 bytes changed")
+    styled = root / "styled.mp4"
+    proc = run([APP, str(source), "--o", str(styled), "--hex", "--json", "--text",
+                "--sub-color", "#123456", "--sub-pos", "top"])
+    check(proc.returncode == 0, proc.stderr.decode(errors="replace"))
+    check("T13_HEX" in styled.with_suffix(".txt").read_text(), "Text hex export missing")
+    subtitles = run([FFMPEG, "-v", "error", "-i", str(styled), "-map", "0:s:0", "-f", "srt", "pipe:1"])
+    check(b"hex=" not in subtitles.stdout and b"T13_HEX" not in subtitles.stdout, "Raw hex leaked into subtitles")
+    stream = json.loads(run(["ffprobe", "-v", "error", "-select_streams", "s:0", "-show_streams", "-show_data",
+                            "-of", "json", str(styled)]).stdout)["streams"][0]
+    extra = bytes.fromhex("".join(line.split(":", 1)[1].split("  ")[0].replace(" ", "")
+                                for line in stream["extradata"].splitlines() if ":" in line))
+    check(extra[5] == 255 and extra[26:30] == bytes.fromhex("123456ff"), "Subtitle style ignored")
+    for options in (["--sub-track", "bad"], ["--sub-color", "#12345z"], ["--sub-pos", "left"],
+                    ["--r", ".mp4"]):
+        check(run([APP, str(source), *options]).returncode != 0, "Invalid option accepted: " + str(options))
+    for option in ["--server", "--download", "--raw-stream", "--host", "--aes-key", "--no-decrypt-video", "--live-view"]:
         check(run([APP, option]).returncode != 0, "Transport/decryption option unexpectedly accepted")
 print("Payload extraction, ADPCM/AAC, metadata fields and protocol boundaries passed.")

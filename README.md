@@ -22,8 +22,9 @@ the duplicate top-level `doc/` directory has been removed.
 ## Build
 
 Requires C++17, RapidJSON, and FFmpeg development libraries (`libavformat`,
-`libavcodec`, `libavutil`, `libswresample`; discovered through pkg-config on
-Unix/MinGW). External `ffmpeg`/`ffprobe` are still needed for privacy rendering
+`libavcodec`, `libavutil`, `libswresample`, `libswscale`; discovered through
+pkg-config on Unix/MinGW), plus Python 3.11+ development headers/libraries for
+the default Python-enabled build. External `ffmpeg`/`ffprobe` are still needed for privacy rendering
 and MP4 container processing, but raw-video/PCM muxing uses the shared library.
 For standalone MSVC builds, set `FFMPEG_DIR` and, for static FFmpeg, supply its
 transitive dependencies through `MEDIA_FORMAT_FFMPEG_EXTRA_LIBRARIES`.
@@ -63,6 +64,29 @@ SDK's `lib`/`opencv453/lib` directories in `LD_LIBRARY_PATH` before launch.
 For local core development, `MEDIA_FORMAT_SOURCE_DIR` may point to a sibling
 checkout; normal builds use the committed core submodule revision.
 
+The Python bridge is enabled by default. Image-based privacy redaction needs
+the plugin dependencies, Python 3.11+ development files, and `libswscale`:
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r deps/media-format-core/plugin/python/ai/privacy-redaction/requirements.txt
+cmake -S . -B build \
+  -DPython3_EXECUTABLE="$PWD/.venv/bin/python" -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j4
+```
+
+If an existing build cached the bridge as disabled, reconfigure once with
+`-DMEDIA_FORMAT_ENABLE_PYTHON_BRIDGE=ON`. Set it to `OFF` explicitly for a
+build without Python privacy.
+
+Install the local face and plate models using the plugin's
+[`download_models.py`](deps/media-format-core/plugin/python/ai/privacy-redaction/download_models.py),
+and supply local `yolov8n.pt` tracker weights in `MEDIA_FORMAT_AI_MODEL_DIR`
+(default `~/.cache/media-format-core/ai/models`). OCR is enabled by default;
+install the native Tesseract executable alongside `pytesseract`. Model downloads
+never run during media processing. See the
+[plugin setup instructions](deps/media-format-core/plugin/python/ai/privacy-redaction/README.md).
+
 ## Usage
 
 Single file:
@@ -82,6 +106,33 @@ Existing MP4 to output MP4:
 ```bash
 ./bin/media_extractor input.mp4 --o ./out/.mp4 --json
 ```
+
+Image-based face and plate privacy, without a configuration file:
+
+```bash
+# Default: balanced detection, labeled highlights, OCR enabled.
+./bin/media_extractor input.mp4 --privacy-redaction --o preview.mp4
+
+# Blur detected faces and plates throughout a folder.
+./bin/media_extractor --input-folder ../../velocitor/media/921_0 \
+  --r ../../velocitor/media/921_blur/.mp4 --privacy-redaction --privacy-mode blur
+```
+
+`--privacy-mode` accepts `highlight`, `blur`, `pixelate`, or `solid`.
+Highlight draws boxes only. Blur strength is derived from the detected region's
+size; there is no numeric `--blur` option. `--privacy-config <file>` supplies
+JSON processor settings, and `--privacy-mode` overrides the JSON mode.
+`plate_ocr_enabled=false` disables OCR; confirmed plate detections can still
+be masked. Plate text and crop export are disabled by default.
+
+The build records the Python executable and plugin location. Override these
+with `--privacy-python <path>` and `--privacy-plugin-dir <dir>` when needed;
+the directory must contain `privacy_redaction.py`, and Python must match the
+CPython library used to build the bridge. Each input uses a fresh processor.
+Python rendering supports ordinary MP4, raw Annex-B, and media-frame files
+without requiring Type 13 metadata. It preserves MP4 video timestamps and
+audio/subtitle packets. A processing failure prevents publication of a partial
+privacy output. Python privacy cannot be combined with `--face-*` or `--forward-*`.
 
 Face privacy rendering from Type 13 `face_rect` metadata:
 
@@ -157,6 +208,19 @@ container. `--no-decode-audio` retains raw audio without adding it to a containe
 Raw `.audio` files preserve their original frame payloads, including prefixes.
 Raw video payloads are not decrypted; encrypted recordings remain unsupported.
 
+Extracted containers include readable telemetry subtitles by default. Use
+`--sub-track off` to disable adding them, `--sub-color red` or
+`--sub-color '#RRGGBB'` to change color, and `--sub-pos top|bottom` for the
+position hint. Cues group metadata per second; JSON/text sidecars retain all
+events. Existing MP4 subtitle tracks are preserved during remuxing and Python
+privacy rendering; these options control subtitles added during extraction.
+
+`--hex` includes exact Type 13/15 payloads as `T13_HEX`/`T15_HEX` events in
+`--json` and `--text` sidecars. Hex is never placed in subtitle tracks.
+`--ffmpeg <path>` selects the executable for container remuxing, raw video
+extraction, and metadata-based privacy. Python privacy uses the shared
+library's embedded FFmpeg path.
+
 For MP4 inputs, the extractor also scans the bytes after the final valid
 top-level MP4 box. If a documented Streamax media-frame tail is found there,
 the tail is parsed in metadata-only mode. The MP4 video/audio streams still come
@@ -190,13 +254,14 @@ in one H.264 encode (`veryfast`, CRF 27, faststart). Missing metadata for one
 category produces an explicit coverage warning; SDK errors and invalid timing
 fail. Forward-only rendering with no supported ADAS results fails.
 
-MP4 privacy rendering requires the indexed Streamax export layout validated on
+Type 13 MP4 privacy rendering requires the indexed Streamax export layout validated on
 the `914` recordings: a 56-byte clock footer, ordered in-range sample indices,
 and non-reordered video starting at PTS zero. Video PTS is translated into the
 camera clock using the footer anchor. Sparse metadata does not shift overlays,
 and MP4 variable frame timestamps are preserved. Other MP4 layouts are refused
 for privacy rendering but remain available for ordinary remux/JSON extraction.
-Raw Annex-B has no metadata timeline and cannot be privacy-rendered.
+Raw Annex-B has no metadata timeline and cannot use Type 13 privacy rendering;
+it can use `--privacy-redaction`.
 
 The optional vendor SDK is loaded only for `--forward-*`. Its archive is under
 `deps/media-format-core/doc/streamax_ainfo_parse_api/2026-09-22/`; CMake extracts it into the build

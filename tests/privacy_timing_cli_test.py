@@ -162,10 +162,13 @@ with tempfile.TemporaryDirectory(prefix="media-privacy-timing-") as folder:
                                         2026, 9, 14, 16, 49, 59, 56, 0xff313233, 0, 0)
     indexed.write_bytes(with_footer(indexed_record(6)))
     output = root / "indexed-mask.mp4"
-    proc = run([APP, str(indexed), "--face-mask", "--json", "--o", str(output)])
+    proc = run([APP, str(indexed), "--face-mask", "--json", "--hex", "--o", str(output)])
     check(proc.returncode == 0, proc.stderr.decode(errors="replace"))
     decoded = run([FFMPEG, "-v", "error", "-i", str(output), "-pix_fmt", "gray", "-f", "rawvideo", "pipe:1"])
     check(decoded.returncode == 0 and len(decoded.stdout) == 8 * 4096, "Indexed rendering changed frame count")
+    indexed_events = json.loads(output.with_suffix(".json").read_text())
+    check(any(e["kind"] == "T13_HEX" and e["video_frame_idx"] == 6 for e in indexed_events),
+          "Indexed hex must use the carrier sample index")
     for index in range(8):
         value = decoded.stdout[index * 4096 + 24 * 64 + 24]
         check(value < 30 if index >= 1 else value > 200,
